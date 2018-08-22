@@ -346,15 +346,12 @@ class AtariPlayer(Agent):
         self.obs_stack = None
 
     def push_obs(self, obs) -> torch.Tensor:
-        obs = torch.from_numpy(obs).float()/255.0  # [210,160,3]
-        obs = F.interpolate(obs.mean(dim=2).view(1, 1, 210, 160), size=(110, 84), mode='nearest')[0][0]  # [110,84]
-        # center crop - 110 = 13+84+13
-        obs = obs[13:13+84, :]  # [84,84]
+        # [210,160,3]>[110,84]>[84,84] is done in env wrapper
+        obs = torch.from_numpy(obs).squeeze(2)  # [84,84,1] > [84,84]
 
         if self.obs_stack is None:
-            self.obs_stack = deque([obs]*self.obs_stack_count)
+            self.obs_stack = deque([obs]*self.obs_stack_count, maxlen=self.obs_stack_count)
         else:
-            self.obs_stack.popleft()
             self.obs_stack.append(obs)
 
         self.state = torch.stack(list(self.obs_stack), dim=0)  # [4,84,84]
