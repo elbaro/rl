@@ -290,22 +290,26 @@ class Agent(object):
         if target_net is None:
             # Q(s0,a0) ~= r0+decay*maxQ(s1,?)*(done?0:1)
             with torch.no_grad():
-                next_q, _ = self.net(batch.s1.to(device)).max(dim=1)
-                Q1 = batch.r0.to(device) + self.decay*next_q*(1-batch.done.float().to(device))
+                next_q, _ = self.net(batch.s1.to(device, non_blocking=True)).max(dim=1)
+                Q1 = batch.r0.to(device, non_blocking=True) + self.decay*next_q * \
+                    (1-batch.done.float().to(device, non_blocking=True))
 
-            Q0 = torch.gather(self.net(batch.s0.to(device)), dim=1, index=batch.a0.unsqueeze(1).to(device)).squeeze(1)
+            Q0 = torch.gather(self.net(batch.s0.to(device, non_blocking=True)), dim=1,
+                              index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
             loss = F.smooth_l1_loss(Q0, Q1.detach())
         else:
             # a1 = argmax Q(s1, ?)
             # Q(s0,a0) ~= r0+decay*Q'(s1,a1)*(done?0:1)
             with torch.no_grad():
-                s1 = batch.s1.to(device)
+                s1 = batch.s1.to(device, non_blocking=True)
                 a1 = self.net(s1).argmax(dim=1)
                 next_q = target_net(s1)
                 next_q = torch.gather(next_q, dim=1, index=a1.unsqueeze(1)).squeeze(1)
-                Q1 = batch.r0.to(device) + self.decay*next_q*(1-batch.done.float().to(device))
+                Q1 = batch.r0.to(device, non_blocking=True) + self.decay*next_q * \
+                    (1-batch.done.float().to(device, non_blocking=True))
 
-            Q0 = torch.gather(self.net(batch.s0.to(device)), dim=1, index=batch.a0.unsqueeze(1).to(device)).squeeze(1)
+            Q0 = torch.gather(self.net(batch.s0.to(device, non_blocking=True)), dim=1,
+                              index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
             loss = F.smooth_l1_loss(Q0, Q1.detach())
         return loss
 
@@ -321,7 +325,7 @@ class AtariPlayer(Agent):
         assert obs_stack >= 1
 
         if net is None:
-            net = AtariNetwork(env.action_space.n).to(device)
+            net = AtariNetwork(env.action_space.n).to(device, non_blocking=True)
 
         # # 1D : obs_shape=[128]
         # if len(obs_shape) == 1:
@@ -361,13 +365,13 @@ class AtariPlayer(Agent):
             action = random.randint(0, self.action_count-1)
         else:
             action = self.get_actions_for_states(
-                self.state.unsqueeze(0).to(device)
+                self.state.unsqueeze(0).to(device, non_blocking=True)
             )[0].item()
 
         return action
 
     def get_next_action_with_q(self, exploration_rate):
-        state = self.state.unsqueeze(0).to(device)
+        state = self.state.unsqueeze(0).to(device, non_blocking=True)
         if random.random() < exploration_rate:
             action = random.randint(0, self.action_count-1)
             q = self.get_qs_for_states(state).item()
@@ -415,7 +419,7 @@ class AgentTrainer(object):
             self.memory = None
 
         self.agent = AtariPlayer(env)
-        self.target_net = AtariNetwork(self.agent.action_count).to(device)
+        self.target_net = AtariNetwork(self.agent.action_count).to(device, non_blocking=True)
         self.opt = torch.optim.RMSprop(self.agent.get_network().parameters(), lr=0.0002)
 
         self.tb = SummaryWriter(log_dir=f'/data/rl/logs/{env.spec.id}')
