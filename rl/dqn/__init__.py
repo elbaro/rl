@@ -308,9 +308,8 @@ class AtariPlayer(Agent):
         Player may repeat an action.
     """
 
-    def __init__(self, env, net=None, obs_stack=4, action_repeat=4):
+    def __init__(self, env, net=None, obs_stack=4):
         assert obs_stack >= 1
-        assert action_repeat >= 1
 
         if net is None:
             net = AtariNetwork(env.action_space.n).to(device)
@@ -328,20 +327,10 @@ class AtariPlayer(Agent):
         )
         # obs_shape=env.observation_space.shape,
         self.obs_stack_count = obs_stack
-        self.action_repeat = action_repeat
-        self.reset_episode()
-
-        # declare
-        self.last_action = None
-        self.last_q = None
         self.obs_stack = None
-        self.action_repeat_counter = 0
-        self.action_current = None
 
     def reset_episode(self):
         self.obs_stack = None
-        self.action_repeat_counter = 0
-        self.action_current = None
 
     def push_obs(self, obs) -> torch.Tensor:
         obs = torch.from_numpy(obs).float()/255.0  # [210,160,3]
@@ -359,36 +348,25 @@ class AtariPlayer(Agent):
         return self.state
 
     def get_next_action(self, exploration_rate):
-        if self.action_repeat_counter == 0:
-            if random.random() < exploration_rate:
-                self.last_action = random.randint(0, self.action_count-1)
-            else:
-                self.last_action = self.get_actions_for_states(
-                    self.state.unsqueeze(0).to(device)
-                )[0].item()
+        if random.random() < exploration_rate:
+            action = random.randint(0, self.action_count-1)
+        else:
+            action = self.get_actions_for_states(
+                self.state.unsqueeze(0).to(device)
+            )[0].item()
 
-        self.action_repeat_counter += 1
-        if self.action_repeat_counter == self.action_repeat:
-            self.action_repeat_counter = 0
-
-        return self.last_action
+        return action
 
     def get_next_action_with_q(self, exploration_rate):
-        if self.action_repeat_counter == 0:
-            state = self.state.unsqueeze(0).to(device)
-            if random.random() < exploration_rate:
-                self.last_action = random.randint(0, self.action_count-1)
-                self.last_q = self.get_qs_for_states(state).item()
-            else:
-                a, q = self.get_actions_and_qs_for_states(state)
-                self.last_action = a.item()
-                self.last_q = q.item()
+        state = self.state.unsqueeze(0).to(device)
+        if random.random() < exploration_rate:
+            action = random.randint(0, self.action_count-1)
+            q = self.get_qs_for_states(state).item()
+        else:
+            action, q = self.get_actions_and_qs_for_states(state)
+            action, q = action.item(), q.item()
 
-        self.action_repeat_counter += 1
-        if self.action_repeat_counter == self.action_repeat:
-            self.action_repeat_counter = 0
-
-        return self.last_action, self.last_q
+        return action, q
 
 
 class AgentTrainer(object):
@@ -511,13 +489,3 @@ class AgentTrainer(object):
 
         bar_frame.close()
         bar_episode.close()
-
-
-class GymAgent(nn.Module):
-    def __init__(self, env_name='BreakoutDeterministic-v4'):
-        self.env = gym.make(env_name)
-        obs = self.env.reset()
-
-
-class EpsilonAgent(nn.Module):
-    pass
