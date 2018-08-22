@@ -238,7 +238,7 @@ class Agent(object):
         [type] -- [description]
     """
 
-    def __init__(self, action_count, network, decay=0.9):
+    def __init__(self, action_count, network, decay=0.99):
         super().__init__()
         self.action_count = action_count
         self.net = network
@@ -277,7 +277,7 @@ class Agent(object):
             q, _ = self.net(states).max(dim=1)
             return q
 
-    def loss_on_batch(self, batch, second_net=None):
+    def loss_on_batch(self, batch, target_net=None):
         """batch of (s0a0r0s1a1done)
 
         An external trainer is responsible for opt.zero_grad() and opt.step()
@@ -287,17 +287,26 @@ class Agent(object):
         """
         assert isinstance(batch, dict)
         batch = SimpleNamespace(**batch)
-        if second_net is None:
+        if target_net is None:
             # Q(s0,a0) ~= r0+decay*maxQ(s1,?)*(done?0:1)
             with torch.no_grad():
                 next_q, _ = self.net(batch.s1.to(device)).max(dim=1)
                 Q1 = batch.r0.to(device) + self.decay*next_q*(1-batch.done.float().to(device))
 
             Q0 = torch.gather(self.net(batch.s0.to(device)), dim=1, index=batch.a0.unsqueeze(1).to(device)).squeeze(1)
-            loss = F.mse_loss(Q0, Q1.detach())
+            loss = F.smooth_l1_loss(Q0, Q1.detach())
         else:
-            # Q(s0,a0) ~= r0+decay*Q(s1,?)*(done?0:1)
-            raise NotImplementedError
+            # a1 = argmax Q(s1, ?)
+            # Q(s0,a0) ~= r0+decay*Q'(s1,a1)*(done?0:1)
+            with torch.no_grad():
+                s1 = batch.s1.to(device)
+                a1 = self.net(s1).argmax(dim=1)
+                next_q = target_net(s1)
+                next_q = torch.gather(next_q, dim=1, index=a1.unsqueeze(1)).squeeze(1)
+                Q1 = batch.r0.to(device) + self.decay*next_q*(1-batch.done.float().to(device))
+
+            Q0 = torch.gather(self.net(batch.s0.to(device)), dim=1, index=batch.a0.unsqueeze(1).to(device)).squeeze(1)
+            loss = F.smooth_l1_loss(Q0, Q1.detach())
         return loss
 
 
@@ -406,14 +415,14 @@ class AgentTrainer(object):
             self.memory = None
 
         self.agent = AtariPlayer(env)
-        self.target_q = AtariNetwork(self.agent.action_count).to(device)
-        self.opt = torch.optim.RMSprop(self.agent.get_network().parameters())
+        self.target_net = AtariNetwork(self.agent.action_count).to(device)
+        self.opt = torch.optim.RMSprop(self.agent.get_network().parameters(), lr=0.0002)
 
         self.tb = SummaryWriter(log_dir=f'/data/rl/logs/{env.spec.id}')
         self.saver = tinder.saver.Saver('/data/rl/weights', env.spec.id)
         self.model = SimpleNamespace(
             net=self.agent.net,
-            net_target=self.target_q,
+            target_net=self.target_net,
             opt=self.opt,
             frame_i=0,
             episode_i=0,
@@ -421,7 +430,9 @@ class AgentTrainer(object):
 
         self.saver.load_latest(self.model)
 
-    def train(self, frame_total, render_episode_period, batch_size, episode_save_period=10):
+    def train(self, frame_total, render_episode_period, batch_size,
+              frame_target_update_period=10000,
+              episode_save_period=10, clipping_reward=True):
         model = self.model
 
         frame_i = model.frame_i
@@ -454,6 +465,12 @@ class AgentTrainer(object):
                 action, q = self.agent.get_next_action_with_q(exploration_rate=exploration_rate)
                 self.tb.add_scalar('Q', q, frame_i)
                 obs, reward, is_done, _ = self.env.step(action)
+                if clipping_reward:
+                    if reward > 0:
+                        reward = 1.0
+                    elif reward < 0:
+                        reward = -1.0
+
                 self.agent.push_obs(obs)
                 if (render_episode_period is not None) and (episode_i % render_episode_period == 0):
                     self.env.render()
@@ -478,9 +495,12 @@ class AgentTrainer(object):
                         continue
 
                     self.opt.zero_grad()
-                    loss = self.agent.loss_on_batch(batch)
+                    loss = self.agent.loss_on_batch(batch, target_net=self.target_net)
                     loss.backward()
                     self.opt.step()
+
+                if frame_i % frame_target_update_period == 0:
+                    tinder.rl.copy_params(src=self.agent.get_network(), dst=self.target_net)
 
             if episode_i % episode_save_period == 0:
                 model.episode_i = episode_i
