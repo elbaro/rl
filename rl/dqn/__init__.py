@@ -1,3 +1,5 @@
+import time
+import math
 import random
 from collections import deque
 from types import SimpleNamespace
@@ -5,219 +7,130 @@ import tinder
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data.dataloader import default_collate
-import numpy as np
 import gym
 from tensorboardX import SummaryWriter
 import tqdm
+from .replay import ReplayBuffer, PrioritizedReplayBuffer
 
 device = 'cuda'
 
 
-class Network1D(nn.Module):
-    def __init__(self, input_ch, action_count):
-        super().__init__()
-        self.seq = nn.Sequential(
-            tinder.layers.Flatten(),
-            nn.Linear(input_ch, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, action_count),
-        )
+class NoisyLinear(nn.Module):
+    # Borrowed from kaixhin/rainbow
 
-    def forward(self, x):
-        x = self.seq(x)
+    def __init__(self, in_dim, out_dim, std_init=0.4):
+        super(NoisyLinear, self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.std_init = std_init
+        self.weight_mean = nn.Parameter(torch.Tensor(out_dim, in_dim))
+        self.weight_var = nn.Parameter(torch.Tensor(out_dim, in_dim))
+        self.bias_mean = nn.Parameter(torch.Tensor(out_dim))
+        self.bias_var = nn.Parameter(torch.Tensor(out_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        mu_range = 1 / math.sqrt(self.weight_mean.size(1))
+        self.weight_mean.data.uniform_(-mu_range, mu_range)
+        self.weight_var.data.fill_(self.std_init / math.sqrt(self.weight_var.size(1)))
+        self.bias_mean.data.uniform_(-mu_range, mu_range)
+        self.bias_var.data.fill_(self.std_init / math.sqrt(self.bias_var.size(0)))
+
+    def _scale_noise(self, size):
+        x = torch.randn(size, device=device)
+        x = x.sign().mul(x.abs().sqrt())
         return x
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_dim)
+        epsilon_out = self._scale_noise(self.out_dim)
+        self.weight_epsilon = epsilon_out.ger(epsilon_in)
+        self.bias_epsilon = self._scale_noise(self.out_dim)
+
+    def forward(self, input):
+        self.reset_noise()
+
+        if self.training:
+            return F.linear(input, self.weight_mean + self.weight_var.mul(self.weight_epsilon), self.bias_mean + self.bias_var.mul(self.bias_epsilon))
+        else:
+            return F.linear(input, self.weight_mean, self.bias_mean)
 
 
 class AtariNetwork(nn.Module):
     """The original Atari DQN architecture
 
-    env = 210 x 160 -> grayscale -> resize to 110 x 84 -> center crop to 84 x 84
     84×84×4 input, 16 8x8 filters stride=4, 32 4x4 stride=2, fc to 256
-
-    Arguments:
-        nn {[type]} -- [description]
-
-    Returns:
-        [type] -- [description]
     """
 
-    def __init__(self, action_count):
+    def __init__(self, action_count, dueling=True, noisy=True):
         super().__init__()
-        self.seq = nn.Sequential(
-            tinder.layers.AssertSize(None, 4, 84, 84),
-            nn.Conv2d(4, 16, kernel_size=8, stride=4),  # 20,20
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),  # 9,9
-            nn.ReLU(inplace=True),
-            tinder.layers.Flatten(),
-            nn.Linear(2592, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, action_count),
-        )
+        self.dueling = dueling
+
+        if noisy:
+            Linear = NoisyLinear
+        else:
+            Linear = nn.Linear
+
+        if dueling:
+            self.common = nn.Sequential(
+                tinder.layers.AssertSize(None, 4, 84, 84),
+                nn.Conv2d(4, 16, kernel_size=8, stride=4),  # 20,20
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 32, kernel_size=4, stride=2),  # 9,9
+                nn.ReLU(inplace=True),
+                tinder.layers.Flatten(),
+            )
+
+            self.state_value = nn.Sequential(
+                Linear(2592, 256),
+                nn.ReLU(inplace=True),
+                Linear(256, 1),
+            )
+
+            # FC
+            self.advantage = nn.Sequential(
+                Linear(2592, 256),
+                nn.ReLU(inplace=True),
+                Linear(256, action_count),
+            )
+        else:
+            self.seq = nn.Sequential(
+                tinder.layers.AssertSize(None, 4, 84, 84),
+                nn.Conv2d(4, 16, kernel_size=8, stride=4),  # 20,20
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 32, kernel_size=4, stride=2),  # 9,9
+                nn.ReLU(inplace=True),
+                tinder.layers.Flatten(),
+                Linear(2592, 256),
+                nn.ReLU(inplace=True),
+                Linear(256, action_count),
+            )
 
     def forward(self, x):
-        x = self.seq(x)
-        return x
+        # x: 0~1
 
-
-class ReplayBuffer(object):
-    """
-    strategy: circular write
-    """
-
-    def __init__(self, size, use_float32=True):
-        super().__init__()
-        self.capacity = size
-        self.buf = []
-        self.next_row = 0
-        self.use_float32 = use_float32
-
-    def push(self, record):
-        if len(self.buf) < self.capacity:
-            self.buf.append(record)
+        if self.dueling:
+            x = self.common(x)
+            state_value = self.state_value(x)  # [B,1]
+            advantage = self.advantage(x)  # [B,action_count]
+            q = state_value + advantage - advantage.mean(dim=1, keepdim=True)  # [B,action_count]
+            return q
         else:
-            self.buf[self.next_row] = record
-            self.next_row = (self.next_row+1) % self.capacity
+            x = self.seq(x)
+            return x
 
-    def sample(self, batch_size):
-        if len(self.buf) < batch_size:
-            return None
-            # raise RuntimeError('Replay Buffer is not buffered enough to sample')
-        rows = np.random.randint(0, len(self.buf), batch_size)
-        batch = [self.buf[row] for row in rows]
-        batch = default_collate(batch)
+    def get_relative_advantage(self, x):
+        # x: 0~1, not 0~255
 
-        # Python float is 64bit giving us DoubleTensor
-        if self.use_float32:
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor) and batch[key].dtype == torch.float64:
-                    batch[key] = batch[key].float()  # Double to Float
-        return batch
-
-
-class IndexTree(object):
-    def __init__(self, n, init_value):
-        super().__init__()
-        self.n = n
-        N = 1
-        while N < n:
-            N <<= 1
-        N -= 1
-        self.offset = N
-
-        self.tree = np.full(n, init_value)
-
-
-class SumTree(IndexTree):
-    def __init__(self, n):
-        super().__init__(n, init_value=0)
-
-    def update(self, index, new_value):
-        delta = new_value - self.tree[index+self.offset]
-        self.add(index, delta)
-
-    def add(self, index, delta):
-        index += self.offset
-        while index:
-            self.tree[index] += delta
-
-    def query_sum(self, left, right):
-        left += self.offset
-        right += self.offset
-        s = 0
-        while left <= right:
-            if left & 1:
-                s += self.tree[left]
-            if right & 1 ^ 1:
-                s += self.tree[right]
-            left = (left+1) >> 1
-            right = (right-1) >> 1
-        return s
-
-
-class MinTree(IndexTree):
-    def __init__(self, n):
-        # n+1 to prevent oob
-        super().__init__(n+1, init_value=float('-inf'))
-
-    def update(self, index, new_value):
-        """update a point
-
-        Arguments:
-            index {int} -- 1<=index<=n
-            new_value {any}
-        """
-
-        index += self.offset
-        self.tree[index] = new_value
-        index >>= 1
-        while index:
-            m = min(self.tree[index*2], self.tree[index*2+1])
-            self.tree[index] = m
-            index >>= 1
-
-    def query_min(self, left, right):
-        left += self.offset
-        right += self.offset
-        m = float('+inf')
-        while left <= right:
-            if self.tree[left] < m:
-                m = self.tree[left]
-            if self.tree[right] < m:
-                m = self.tree[right]
-            left = (left+1) >> 1
-            right = (right-1) >> 1
-        return m
-
-
-class PrioritizedReplayBuffer(ReplayBuffer):
-    """
-    strategy: sample with TD error
-    """
-
-    def __init__(self, size, alpha=0.6):  # 0.6 for atari
-        raise NotImplementedError
-
-        # super().__init__()
-        # self.capacity = size
-        # self.buf = []
-        # self.next_row = 0
-        # self.alpha = alpha
-
-        # self.sum_tree = SumTree(size)
-        # self.min_tree = MinTree(size)
-
-    def push(self, record):
-        if len(self.buf) < self.capacity:
-            row = len(self.buf)
-            self.buf.append(record)
+        if self.dueling:
+            x = self.common(x)
+            adv = self.advantage(x)
+            return adv
         else:
-            row = self.next_row
-            self.buf[self.next_row] = record
-            self.next_row = (self.next_row+1) % self.capacity
+            return self.seq(x)
 
-        # update row
-        pass
-
-    def sample(self, batch_size):
-        # if len(self.buf) < batch_size:
-        #     raise RuntimeError('Replay Buffer is not buffered enough to sample')
-        # rows = np.random.randint(0, len(self.buf), batch_size)
-        pass
-
-        batch = [self.buf[row] for row in rows]
-        return default_collate(batch)
-
-    def update_priority(self, index, priority):
-        assert priority > 0
-        assert 0 <= index < len(self.buf)
+# def byte_to_gpu_float(x):
+#     return x.to(device, dtype=torch.float32, non_blocking=True) / 255.0
 
 
 class Agent(object):
@@ -255,172 +168,94 @@ class Agent(object):
         2D: states = [N, stack*ch, H, W]
         1D: states = [N, stack*ch, dim]
         """
-
         with torch.no_grad():
-            return self.net(states).argmax(dim=1)
+            if self.net.dueling:
+                return self.net.get_relative_advantage(states).argmax(dim=1)
+            else:
+                return self.net(states).argmax(dim=1)
 
-    def get_actions_and_qs_for_states(self, states) -> torch.Tensor:
-        """
-        cpu input->cpu output
-        gpu input->gpu output
-
-        2D: states = [N, stack*ch, H, W]
-        1D: states = [N, stack*ch, dim]
-        """
-
-        with torch.no_grad():
-            q, a = self.net(states).max(dim=1)
-            return a, q
-
-    def get_qs_for_states(self, states):
-        with torch.no_grad():
-            q, _ = self.net(states).max(dim=1)
-            return q
-
-    def loss_on_batch(self, batch, target_net=None):
+    def losses_on_batch(self, batch, return_q, target_net=None):
         """batch of (s0a0r0s1a1done)
 
         An external trainer is responsible for opt.zero_grad() and opt.step()
 
         Arguments:
-            batch {torch.Tensor}
+            batch {dict}
         """
         assert isinstance(batch, dict)
         batch = SimpleNamespace(**batch)
-        if target_net is None:
-            # Q(s0,a0) ~= r0+decay*maxQ(s1,?)*(done?0:1)
-            with torch.no_grad():
-                next_q, _ = self.net(batch.s1.to(device, non_blocking=True)).max(dim=1)
-                Q1 = batch.r0.to(device, non_blocking=True) + self.decay*next_q * \
-                    (1-batch.done.float().to(device, non_blocking=True))
 
-            Q0 = torch.gather(self.net(batch.s0.to(device, non_blocking=True)), dim=1,
-                              index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
-            loss = F.smooth_l1_loss(Q0, Q1.detach())
-        else:
-            # a1 = argmax Q(s1, ?)
-            # Q(s0,a0) ~= r0+decay*Q'(s1,a1)*(done?0:1)
-            with torch.no_grad():
-                s1 = batch.s1.to(device, non_blocking=True)
-                a1 = self.net(s1).argmax(dim=1)
+        # a1 = argmax Q(s1, ?)
+        # Q(s0,a0) ~= r0+decay*Q'(s1,a1)*(done?0:1)
+        with torch.no_grad():
+            if target_net is None:
+                next_q, _ = self.net(batch.s1.to(device, dtype=torch.float32, non_blocking=True) / 255.0).max(dim=1)
+            else:
+
+                s1 = batch.s1.to(device, dtype=torch.float32, non_blocking=True) / 255.0
+                a1 = self.net.get_relative_advantage(s1).argmax(dim=1)
                 next_q = target_net(s1)
                 next_q = torch.gather(next_q, dim=1, index=a1.unsqueeze(1)).squeeze(1)
-                Q1 = batch.r0.to(device, non_blocking=True) + self.decay*next_q * \
-                    (1-batch.done.float().to(device, non_blocking=True))
+            Q1 = (
+                batch.r0.to(device, dtype=torch.float32, non_blocking=True) +
+                self.decay*next_q * (1-batch.done.float().to(device, non_blocking=True))
+            )
 
-            Q0 = torch.gather(self.net(batch.s0.to(device, non_blocking=True)), dim=1,
-                              index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
-            loss = F.smooth_l1_loss(Q0, Q1.detach())
-        return loss
+        Q0 = torch.gather(self.net(batch.s0.to(device, dtype=torch.float32, non_blocking=True) / 255.0), dim=1,
+                          index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
+        losses = F.smooth_l1_loss(Q0, Q1.detach(), reduction='none')
 
+        if return_q:
+            with torch.no_grad():
+                q = Q0.mean()
+            return losses, q.item()
+        return losses
 
-class AtariPlayer(Agent):
-    """
-        Player is aware of observations.
-        Player stacks observations to create states.
-        Player may repeat an action.
-    """
-
-    def __init__(self, env, net=None, obs_stack=4):
-        assert obs_stack >= 1
-
-        if net is None:
-            net = AtariNetwork(env.action_space.n).to(device, non_blocking=True)
-
-        # # 1D : obs_shape=[128]
-        # if len(obs_shape) == 1:
-        #     self.net = Network1D(obs_shape[0]*obs_stack, action_count)
-        # # ? 2D -> atari?
-        # else:
-        #     self.net = AtariNetwork(action_count)
-        # 1D?
-        super().__init__(
-            action_count=env.action_space.n,
-            network=net,
-        )
-        # obs_shape=env.observation_space.shape,
-        self.obs_stack_count = obs_stack
-        self.obs_stack = None
-
-    def reset_episode(self):
-        self.obs_stack = None
-
-    def push_obs(self, obs) -> torch.Tensor:
-        # [210,160,3]>[110,84]>[84,84] is done in env wrapper
-        obs = torch.from_numpy(obs).squeeze(2)  # [84,84,1] > [84,84]
-
-        if self.obs_stack is None:
-            self.obs_stack = deque([obs]*self.obs_stack_count, maxlen=self.obs_stack_count)
-        else:
-            self.obs_stack.append(obs)
-
-        self.state = torch.stack(list(self.obs_stack), dim=0)  # [4,84,84]
-        return self.state
-
-    def get_next_action(self, exploration_rate):
+    def get_next_action(self, state, exploration_rate):
         if random.random() < exploration_rate:
             action = random.randint(0, self.action_count-1)
         else:
             action = self.get_actions_for_states(
-                self.state.unsqueeze(0).to(device, non_blocking=True)
-            )[0].item()
+                state.unsqueeze(0).to(device, dtype=torch.float32, non_blocking=True) / 255.0
+            ).item()
 
         return action
-
-    def get_next_action_with_q(self, exploration_rate):
-        state = self.state.unsqueeze(0).to(device, non_blocking=True)
-        if random.random() < exploration_rate:
-            action = random.randint(0, self.action_count-1)
-            q = self.get_qs_for_states(state).item()
-        else:
-            action, q = self.get_actions_and_qs_for_states(state)
-            action, q = action.item(), q.item()
-
-        return action, q
 
 
 class AgentTrainer(object):
     """
-        lr=1e-4,
+        Atari:
+
         buffer_size=10000,
         exploration_fraction=0.1,
         exploration_final_eps=0.01,
-        train_freq=4,
-        learning_starts=10000,
-        target_network_update_freq=1000,
         gamma=0.99,
         prioritized_replay=True,
         prioritized_replay_alpha=0.6,
-        checkpoint_freq=10000,
-        checkpoint_path=None,
-        dueling=True
-
-        clip_rewards=?
-        scaled float frame?
-        episodic life?
-        fire reset?
     """
 
-    def __init__(self, env, use_replay=1, replay_size=None):
-        # TODO: action_repeat=3 for space invader
-        assert 0 <= use_replay <= 2  # 1 for basic, 2 for prioritized
-        assert (use_replay == 0) == (replay_size is None)
-
+    def __init__(self, env, name=None, use_prioritized=True, replay_size=1_000_000, lr=2e-4, dueling=True, noisy=True):
         self.env = env
+        self.use_prioritized = use_prioritized
 
-        if use_replay == 1:
-            self.memory = ReplayBuffer(replay_size)
-        elif use_replay == 2:
+        if use_prioritized:
             self.memory = PrioritizedReplayBuffer(replay_size)
         else:
-            self.memory = None
+            self.memory = ReplayBuffer(replay_size)
 
-        self.agent = AtariPlayer(env)
-        self.target_net = AtariNetwork(self.agent.action_count).to(device, non_blocking=True)
-        self.opt = torch.optim.RMSprop(self.agent.get_network().parameters(), lr=0.0002)
+        net = AtariNetwork(env.action_space.n, dueling=dueling, noisy=noisy).to(device, non_blocking=True)
+        self.agent = Agent(action_count=env.action_space.n, network=net)
+        self.target_net = AtariNetwork(self.agent.action_count, dueling=dueling,
+                                       noisy=noisy).to(device, non_blocking=True)
+        self.opt = torch.optim.RMSprop(self.agent.get_network().parameters(), lr=lr)
 
-        self.tb = SummaryWriter(log_dir=f'/data/rl/logs/{env.spec.id}')
-        self.saver = tinder.saver.Saver('/data/rl/weights', env.spec.id)
+        if name:
+            name = env.spec.id + '-'+name
+        else:
+            name = env.spec.id
+
+        self.tb = SummaryWriter(log_dir=f'/data/rl/{name}/logs')
+        self.saver = tinder.saver.Saver(f'/data/rl/', name)
         self.model = SimpleNamespace(
             net=self.agent.net,
             target_net=self.target_net,
@@ -429,50 +264,80 @@ class AgentTrainer(object):
             episode_i=0,
         )
 
-        self.saver.load_latest(self.model)
+        if self.saver.load_latest(self.model):
+            print('restored model')
+        else:
+            print('new model from scratch')
 
-    def train(self, frame_total, render_episode_period, batch_size,
-              frame_target_update_period=10000,
-              episode_save_period=10, clipping_reward=True):
+    def play(self, sleep=0):
+        model = self.model
+        is_playing = True
+        episode_reward = 0
+        s0 = self.env.reset()  # list [o1,o2,o3,o4]
+        frame_i = 0
+
+        while is_playing:
+            frame_i += 1
+            action = self.agent.get_next_action(s0, exploration_rate=0)
+            # print(action, self.env.unwrapped.get_action_meanings()[action])
+
+            s1, reward, is_done, _info = self.env.step(action)
+            self.env.render()
+            episode_reward += reward
+
+            if is_done:
+                is_playing = False
+
+            s0 = s1
+
+            if sleep > 0:
+                time.sleep(sleep)
+
+        print('episode reward:', episode_reward)
+        print('frame #: ', frame_i)
+
+    def train(self,
+              frame_total,
+              render_episode_period,
+              batch_size=32,
+              frame_target_update_period=1_000,  # 1k (pong in 30m) or 10k
+              episode_save_period=100,
+              frame_train_period=4,
+              frame_learning_start=10_000,
+              exploration_frame_ratio=0.5,
+              exploration_min=0.02,):
         model = self.model
 
         frame_i = model.frame_i
         episode_i = model.episode_i
 
-        bar_episode = tqdm.tqdm(initial=episode_i, leave=True)
-        bar_frame = tqdm.tqdm(initial=frame_i, total=frame_total, leave=True)
+        bar_episode = tqdm.tqdm(initial=episode_i, leave=True, ncols=70)
+        bar_frame = tqdm.tqdm(initial=frame_i, total=frame_total, leave=True, ncols=70)
+
+        exploration_frame_count = frame_total * exploration_frame_ratio
 
         while frame_i < frame_total:  # new episode
             episode_i += 1
+            episode_reward = 0
             bar_episode.update()
 
             is_playing = True
-            obs = self.env.reset()
-            self.agent.reset_episode()
-            self.agent.push_obs(obs)
-
-            s0 = self.agent.state
+            s0 = self.env.reset()
 
             while is_playing and frame_i < frame_total:
                 frame_i += 1
                 bar_frame.update()
 
-                if frame_i < 1_000_000:
-                    exploration_rate = 1 - frame_i/1_000_000*0.9
+                if frame_i < exploration_frame_count:
+                    exploration_rate = 1 - frame_i/exploration_frame_count*(1-exploration_min)
                 else:
-                    exploration_rate = 0.1
+                    exploration_rate = exploration_min
 
-                # action = self.agent.get_next_action(exploration_rate=exploration_rate)
-                action, q = self.agent.get_next_action_with_q(exploration_rate=exploration_rate)
-                self.tb.add_scalar('Q', q, frame_i)
-                obs, reward, is_done, _ = self.env.step(action)
-                if clipping_reward:
-                    if reward > 0:
-                        reward = 1.0
-                    elif reward < 0:
-                        reward = -1.0
+                action = self.agent.get_next_action(s0, exploration_rate=exploration_rate)
 
-                self.agent.push_obs(obs)
+                s1, reward, is_done, _ = self.env.step(action)
+                episode_reward += reward
+
                 if (render_episode_period is not None) and (episode_i % render_episode_period == 0):
                     self.env.render()
 
@@ -480,33 +345,50 @@ class AgentTrainer(object):
                     is_playing = False
 
                 self.memory.push({
-                    's0': s0,
+                    's0': s0,  # lazy
                     'a0': action,
                     'r0': reward,
-                    's1': self.agent.state,
+                    's1': s1,  # lazy
                     'done': is_done,
                 })
 
+                s0 = s1
+
                 # train
-                if self.memory is None:
-                    pass
-                else:
-                    batch = self.memory.sample(batch_size)
-                    if batch is None:
-                        continue
+                if frame_i % frame_train_period == 0 and frame_i >= frame_learning_start:
+                    if self.use_prioritized:
+                        ret = self.memory.sample(batch_size*frame_train_period)
+                        if ret is None:
+                            continue
+                        batch, rma, weights = ret
+                    else:
+                        batch = self.memory.sample(batch_size*frame_train_period)
+                        if batch is None:
+                            continue
 
                     self.opt.zero_grad()
-                    loss = self.agent.loss_on_batch(batch, target_net=self.target_net)
+                    losses, q = self.agent.losses_on_batch(batch, return_q=True, target_net=self.target_net)
+                    if self.use_prioritized:
+                        self.memory.update_priority(rma, losses.detach())
+                        losses *= weights.detach().to(device)
+                    loss = losses.mean()
                     loss.backward()
                     self.opt.step()
 
-                if frame_i % frame_target_update_period == 0:
-                    tinder.rl.copy_params(src=self.agent.get_network(), dst=self.target_net)
+                    self.tb.add_scalar('Q', q, frame_i)
+                    self.tb.add_scalar('TD error', loss.item(), frame_i)
+
+                    if frame_i % frame_target_update_period == 0:
+                        tinder.rl.copy_params(src=self.agent.get_network(), dst=self.target_net)
+
+            self.tb.add_scalar('episode.reward', episode_reward, frame_i)
 
             if episode_i % episode_save_period == 0:
                 model.episode_i = episode_i
                 model.frame_i = frame_i
-                self.saver.save(model, epoch=episode_i)
+                self.saver.save(model, epoch=episode_i, score=episode_reward)
+
+        self.saver.save(model, epoch=episode_i, score=episode_reward)
 
         bar_frame.close()
         bar_episode.close()

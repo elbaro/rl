@@ -1,0 +1,4 @@
+### PongDeterministic-v4
+This is guaranteed to work:
+```python -m rl.example per=False dueling=False gpu=1 replay_size=200000```
+
