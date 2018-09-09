@@ -53,7 +53,7 @@ class IndexTree(object):
         # self.tree = np.full(self.offset + n + 1, init_value)
 
         # full binary tree for convenience
-        self.tree = np.full(self.offset * 2 + 2, init_value)
+        self.tree = np.full(self.offset * 2 + 2, init_value, dtype=np.float32)
 
 
 class SumTree(IndexTree):
