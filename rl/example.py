@@ -12,15 +12,23 @@ tinder.bootstrap()
 
 config = SimpleNamespace(
     name='',
-    # env='PongNoFrameskip-v4',
-    env='PongDeterministic-v4',
-    replay_size=100_000,
+    # env='PongDeterministic-v4',
+    env='SpaceInvadersDeterministic-v4',
     mode='train',
     gpu=tinder.config.Placeholder.STR,
+
+    replay_size=300_000,
+    frame_exploration=1*1_000_000,
+    frame=10*1_000_000,
 
     per=True,
     noisy=True,
     dueling=True,
+    clip=True,
+    episodic_life=True,
+    episodic_score=False,
+
+    delay=0.01,
 )
 tinder.config.override(config)
 
@@ -41,16 +49,17 @@ tinder.config.override(config)
 # )
 
 env = gym.make(config.env)
-env = Wrapper(env, end_on_negative_score=False)
+env = Wrapper(env, episodic_life=config.episodic_life, episodic_score=config.episodic_score, clip_reward=config.clip)
 trainer = AgentTrainer(env, name=config.name, replay_size=config.replay_size,
                        use_prioritized=config.per, dueling=config.dueling, noisy=config.noisy)  # 1M -> >60GB
 
 # PongNoFrameskip-v4: 1M
 # Others: >50M
 if config.mode == 'train':
-    trainer.train(frame_total=2*1_000_000, render_episode_period=10, frame_target_update_period=10_000)
+    trainer.train(frame_total=config.frame, frame_exploration_count=config.frame_exploration,
+                  render_episode_period=10, frame_target_update_period=10_000)
 elif config.mode == 'play':
-    trainer.play(sleep=0.001)
+    trainer.play(sleep=config.delay)
 else:
     raise NotImplementedError
 

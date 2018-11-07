@@ -50,10 +50,9 @@ class IndexTree(object):
             N <<= 1
         N -= 1
         self.offset = N
-        # self.tree = np.full(self.offset + n + 1, init_value)
 
-        # full binary tree for convenience
-        self.tree = np.full(self.offset * 2 + 2, init_value, dtype=np.float32)
+        # complete binary tree for convenience
+        self.tree = np.full(self.offset * 2 + 2, init_value, dtype=np.float64)
 
 
 class SumTree(IndexTree):
@@ -64,12 +63,18 @@ class SumTree(IndexTree):
         assert 1 <= index <= self.n
         assert new_value >= 0
         index += self.offset
-        delta = new_value - self.tree[index]
 
-        # 32 log n = 320 << n
+        self.tree[index] = new_value
+        index >>= 1
         while index > 0:
-            self.tree[index] += delta
+            self.tree[index] = self.tree[index << 1] + self.tree[(index << 1)+1]
             index >>= 1
+
+        # fast, but unstable
+        # delta = new_value - self.tree[index]
+        # while index > 0:
+        #     self.tree[index] += delta
+        #     index >>= 1
 
     def sample(self, batch_size):
         ret = []
@@ -116,7 +121,8 @@ class MinTree(IndexTree):
 
 class PrioritizedReplayBuffer(object):
     """
-    strategy: sample with TD error
+    strategy: sample with highest TD error
+    TODO: numerical stability
     """
 
     def __init__(self, capacity, alpha=0.6):  # 0.6 for atari
@@ -192,3 +198,49 @@ def test_PER():
     print(buf.sample(4))
     print(buf.sample(4))
     print('------')
+
+
+def test_sumtree_sum():
+    s1 = SumTree(1_000_000)
+    s2 = SumTree(1_000_000)
+    k = 0
+
+    for i in range(10):
+        for j in range(1, 1000):
+            k += 10
+            s1.update(j, k)
+    for j in range(1, 1000):
+        s2.update(j, k)
+        k -= 10
+
+    print(s1.tree[1])
+    print(s2.tree[1])
+
+
+def test_sumtree_sample():
+
+    s = SumTree(1_000_000)
+
+    k = 0
+    for i in range(100):
+        for j in range(1, 1000):
+            k += 1
+            s.update(j, k)
+
+    s2 = SumTree(1_000_000)
+    for j in range(999, 0, -1):
+        s2.update(j, k)
+        k -= 1
+
+    for i in range(len(s.tree)):
+        assert s.tree[i] == s2.tree[i]
+
+    rows, probs = s.sample(128_000)
+    for r, p in zip(rows, probs):
+        assert r < 1000
+    print('done')
+
+
+if __name__ == "__main__":
+    test_sumtree_sum()
+    test_sumtree_sample()

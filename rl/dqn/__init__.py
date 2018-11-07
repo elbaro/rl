@@ -297,15 +297,15 @@ class AgentTrainer(object):
         print('frame #: ', frame_i)
 
     def train(self,
-              frame_total,
-              render_episode_period,
+              frame_total=10*1_000_000,
+              frame_exploration_count=1*1_000_000,
+              render_episode_period=10,
               batch_size=32,
               frame_target_update_period=1_000,  # 1k (pong in 30m) or 10k
               episode_save_period=100,
               frame_train_period=4,
               frame_learning_start=10_000,
-              exploration_frame_ratio=0.5,
-              exploration_min=0.02,):
+              exploration_min=0.1,):
         model = self.model
 
         frame_i = model.frame_i
@@ -313,8 +313,6 @@ class AgentTrainer(object):
 
         bar_episode = tqdm.tqdm(initial=episode_i, leave=True, ncols=70)
         bar_frame = tqdm.tqdm(initial=frame_i, total=frame_total, leave=True, ncols=70)
-
-        exploration_frame_count = frame_total * exploration_frame_ratio
 
         while frame_i < frame_total:  # new episode
             episode_i += 1
@@ -328,8 +326,8 @@ class AgentTrainer(object):
                 frame_i += 1
                 bar_frame.update()
 
-                if frame_i < exploration_frame_count:
-                    exploration_rate = 1 - frame_i/exploration_frame_count*(1-exploration_min)
+                if frame_i < frame_exploration_count:
+                    exploration_rate = 1 - frame_i/frame_exploration_count*(1-exploration_min)
                 else:
                     exploration_rate = exploration_min
 
