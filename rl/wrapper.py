@@ -8,7 +8,9 @@ from baselines.common.atari_wrappers import EpisodicLifeEnv
 
 
 class Wrapper(gym.Wrapper):
-    def __init__(self, env, stack=4, episodic_life=False, episodic_score=False, clip_reward=False):
+    def __init__(
+        self, env, stack=4, episodic_life=False, episodic_score=False, clip_reward=False
+    ):
         """
 
         - grayscale
@@ -33,16 +35,19 @@ class Wrapper(gym.Wrapper):
         shp = env.observation_space.shape
         # self.observation_space = gym.spaces.Box(low=0, high=1.0, shape=(
         #     shp[2] * stack, shp[0], shp[1]), dtype=np.float)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(
-            shp[2] * stack, shp[0], shp[1]), dtype=np.uint8)
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(shp[2] * stack, shp[0], shp[1]), dtype=np.uint8
+        )
 
         self.episodic_score = episodic_score
         self.clip_reward = clip_reward
 
     @staticmethod
     def convert_obs(obs):
-        obs = np.asarray(Image.fromarray(obs).convert('L').resize((84, 110), Image.NEAREST))
-        obs = torch.from_numpy(obs[13:13+84, :])
+        obs = np.asarray(
+            Image.fromarray(obs).convert("L").resize((84, 110), Image.NEAREST)
+        )
+        obs = torch.from_numpy(obs[13 : 13 + 84, :])
         return obs
 
     def reset(self):

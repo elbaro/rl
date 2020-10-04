@@ -67,7 +67,7 @@ class SumTree(IndexTree):
         self.tree[index] = new_value
         index >>= 1
         while index > 0:
-            self.tree[index] = self.tree[index << 1] + self.tree[(index << 1)+1]
+            self.tree[index] = self.tree[index << 1] + self.tree[(index << 1) + 1]
             index >>= 1
 
         # fast, but unstable
@@ -97,7 +97,7 @@ class SumTree(IndexTree):
 class MinTree(IndexTree):
     def __init__(self, n):
         # n+1 to prevent oob
-        super().__init__(n, init_value=float('inf'))
+        super().__init__(n, init_value=float("inf"))
 
     def update(self, index, new_value):
         assert 1 <= index <= self.n
@@ -177,8 +177,8 @@ class PrioritizedReplayBuffer(object):
 def test_PER():
     buf = PrioritizedReplayBuffer(capacity=5)
 
-    buf.push({'a': 'A', 'b': 'B1'})
-    buf.push({'a': 'A', 'b': 'B2'})
+    buf.push({"a": "A", "b": "B1"})
+    buf.push({"a": "A", "b": "B2"})
 
     # print(buf.sample(2))
     # print(buf.sample(1))
@@ -186,18 +186,18 @@ def test_PER():
     # print(buf.sample(1))
     # print('------')
 
-    buf.push({'a': 'A', 'b': 'B3'})
-    buf.push({'a': 'A', 'b': 'B4'})
+    buf.push({"a": "A", "b": "B3"})
+    buf.push({"a": "A", "b": "B4"})
 
     # print(buf.sample(2))
     print(buf.sample(2))
     print(buf.sample(2))
-    print('------')
+    print("------")
 
     buf.update_priority([2, 3], torch.Tensor([1.0, 2.0]))
     print(buf.sample(4))
     print(buf.sample(4))
-    print('------')
+    print("------")
 
 
 def test_sumtree_sum():
@@ -238,7 +238,7 @@ def test_sumtree_sample():
     rows, probs = s.sample(128_000)
     for r, p in zip(rows, probs):
         assert r < 1000
-    print('done')
+    print("done")
 
 
 if __name__ == "__main__":

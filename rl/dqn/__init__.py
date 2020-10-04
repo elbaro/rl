@@ -12,7 +12,7 @@ from tensorboardX import SummaryWriter
 import tqdm
 from .replay import ReplayBuffer, PrioritizedReplayBuffer
 
-device = 'cuda'
+device = "cuda"
 
 
 class NoisyLinear(nn.Module):
@@ -51,7 +51,11 @@ class NoisyLinear(nn.Module):
         self.reset_noise()
 
         if self.training:
-            return F.linear(input, self.weight_mean + self.weight_var.mul(self.weight_epsilon), self.bias_mean + self.bias_var.mul(self.bias_epsilon))
+            return F.linear(
+                input,
+                self.weight_mean + self.weight_var.mul(self.weight_epsilon),
+                self.bias_mean + self.bias_var.mul(self.bias_epsilon),
+            )
         else:
             return F.linear(input, self.weight_mean, self.bias_mean)
 
@@ -73,12 +77,12 @@ class AtariNetwork(nn.Module):
 
         if dueling:
             self.common = nn.Sequential(
-                tinder.layers.AssertSize(None, 4, 84, 84),
+                tinder.nn.AssertSize(None, 4, 84, 84),
                 nn.Conv2d(4, 16, kernel_size=8, stride=4),  # 20,20
                 nn.ReLU(inplace=True),
                 nn.Conv2d(16, 32, kernel_size=4, stride=2),  # 9,9
                 nn.ReLU(inplace=True),
-                tinder.layers.Flatten(),
+                tinder.nn.Flatten(),
             )
 
             self.state_value = nn.Sequential(
@@ -95,12 +99,12 @@ class AtariNetwork(nn.Module):
             )
         else:
             self.seq = nn.Sequential(
-                tinder.layers.AssertSize(None, 4, 84, 84),
+                tinder.nn.AssertSize(None, 4, 84, 84),
                 nn.Conv2d(4, 16, kernel_size=8, stride=4),  # 20,20
                 nn.ReLU(inplace=True),
                 nn.Conv2d(16, 32, kernel_size=4, stride=2),  # 9,9
                 nn.ReLU(inplace=True),
-                tinder.layers.Flatten(),
+                tinder.nn.Flatten(),
                 Linear(2592, 256),
                 nn.ReLU(inplace=True),
                 Linear(256, action_count),
@@ -113,7 +117,9 @@ class AtariNetwork(nn.Module):
             x = self.common(x)
             state_value = self.state_value(x)  # [B,1]
             advantage = self.advantage(x)  # [B,action_count]
-            q = state_value + advantage - advantage.mean(dim=1, keepdim=True)  # [B,action_count]
+            q = (
+                state_value + advantage - advantage.mean(dim=1, keepdim=True)
+            )  # [B,action_count]
             return q
         else:
             x = self.seq(x)
@@ -128,6 +134,7 @@ class AtariNetwork(nn.Module):
             return adv
         else:
             return self.seq(x)
+
 
 # def byte_to_gpu_float(x):
 #     return x.to(device, dtype=torch.float32, non_blocking=True) / 255.0
@@ -189,21 +196,29 @@ class Agent(object):
         # Q(s0,a0) ~= r0+decay*Q'(s1,a1)*(done?0:1)
         with torch.no_grad():
             if target_net is None:
-                next_q, _ = self.net(batch.s1.to(device, dtype=torch.float32, non_blocking=True) / 255.0).max(dim=1)
+                next_q, _ = self.net(
+                    batch.s1.to(device, dtype=torch.float32, non_blocking=True) / 255.0
+                ).max(dim=1)
             else:
 
                 s1 = batch.s1.to(device, dtype=torch.float32, non_blocking=True) / 255.0
                 a1 = self.net.get_relative_advantage(s1).argmax(dim=1)
                 next_q = target_net(s1)
                 next_q = torch.gather(next_q, dim=1, index=a1.unsqueeze(1)).squeeze(1)
-            Q1 = (
-                batch.r0.to(device, dtype=torch.float32, non_blocking=True) +
-                self.decay*next_q * (1-batch.done.float().to(device, non_blocking=True))
+            Q1 = batch.r0.to(
+                device, dtype=torch.float32, non_blocking=True
+            ) + self.decay * next_q * (
+                1 - batch.done.float().to(device, non_blocking=True)
             )
 
-        Q0 = torch.gather(self.net(batch.s0.to(device, dtype=torch.float32, non_blocking=True) / 255.0), dim=1,
-                          index=batch.a0.unsqueeze(1).to(device, non_blocking=True)).squeeze(1)
-        losses = F.smooth_l1_loss(Q0, Q1.detach(), reduction='none')
+        Q0 = torch.gather(
+            self.net(
+                batch.s0.to(device, dtype=torch.float32, non_blocking=True) / 255.0
+            ),
+            dim=1,
+            index=batch.a0.unsqueeze(1).to(device, non_blocking=True),
+        ).squeeze(1)
+        losses = F.smooth_l1_loss(Q0, Q1.detach(), reduction="none")
 
         if return_q:
             with torch.no_grad():
@@ -213,10 +228,11 @@ class Agent(object):
 
     def get_next_action(self, state, exploration_rate):
         if random.random() < exploration_rate:
-            action = random.randint(0, self.action_count-1)
+            action = random.randint(0, self.action_count - 1)
         else:
             action = self.get_actions_for_states(
-                state.unsqueeze(0).to(device, dtype=torch.float32, non_blocking=True) / 255.0
+                state.unsqueeze(0).to(device, dtype=torch.float32, non_blocking=True)
+                / 255.0
             ).item()
 
         return action
@@ -224,17 +240,26 @@ class Agent(object):
 
 class AgentTrainer(object):
     """
-        Atari:
+    Atari:
 
-        buffer_size=10000,
-        exploration_fraction=0.1,
-        exploration_final_eps=0.01,
-        gamma=0.99,
-        prioritized_replay=True,
-        prioritized_replay_alpha=0.6,
+    buffer_size=10000,
+    exploration_fraction=0.1,
+    exploration_final_eps=0.01,
+    gamma=0.99,
+    prioritized_replay=True,
+    prioritized_replay_alpha=0.6,
     """
 
-    def __init__(self, env, name=None, use_prioritized=True, replay_size=1_000_000, lr=2e-4, dueling=True, noisy=True):
+    def __init__(
+        self,
+        env,
+        name=None,
+        use_prioritized=True,
+        replay_size=1_000_000,
+        lr=2e-4,
+        dueling=True,
+        noisy=True,
+    ):
         self.env = env
         self.use_prioritized = use_prioritized
 
@@ -243,19 +268,22 @@ class AgentTrainer(object):
         else:
             self.memory = ReplayBuffer(replay_size)
 
-        net = AtariNetwork(env.action_space.n, dueling=dueling, noisy=noisy).to(device, non_blocking=True)
+        net = AtariNetwork(env.action_space.n, dueling=dueling, noisy=noisy).to(
+            device, non_blocking=True
+        )
         self.agent = Agent(action_count=env.action_space.n, network=net)
-        self.target_net = AtariNetwork(self.agent.action_count, dueling=dueling,
-                                       noisy=noisy).to(device, non_blocking=True)
+        self.target_net = AtariNetwork(
+            self.agent.action_count, dueling=dueling, noisy=noisy
+        ).to(device, non_blocking=True)
         self.opt = torch.optim.RMSprop(self.agent.get_network().parameters(), lr=lr)
 
         if name:
-            name = env.spec.id + '-'+name
+            name = env.spec.id + "-" + name
         else:
             name = env.spec.id
 
-        self.tb = SummaryWriter(log_dir=f'/data/rl/{name}/logs')
-        self.saver = tinder.saver.Saver(f'/data/rl/', name)
+        self.tb = SummaryWriter(log_dir=f"/data/rl/{name}/logs")
+        self.saver = tinder.saver.Saver(f"/data/rl/", name)
         self.model = SimpleNamespace(
             net=self.agent.net,
             target_net=self.target_net,
@@ -265,9 +293,9 @@ class AgentTrainer(object):
         )
 
         if self.saver.load_latest(self.model):
-            print('restored model')
+            print("restored model")
         else:
-            print('new model from scratch')
+            print("new model from scratch")
 
     def play(self, sleep=0):
         model = self.model
@@ -293,19 +321,21 @@ class AgentTrainer(object):
             if sleep > 0:
                 time.sleep(sleep)
 
-        print('episode reward:', episode_reward)
-        print('frame #: ', frame_i)
+        print("episode reward:", episode_reward)
+        print("frame #: ", frame_i)
 
-    def train(self,
-              frame_total=10*1_000_000,
-              frame_exploration_count=1*1_000_000,
-              render_episode_period=10,
-              batch_size=32,
-              frame_target_update_period=1_000,  # 1k (pong in 30m) or 10k
-              episode_save_period=100,
-              frame_train_period=4,
-              frame_learning_start=10_000,
-              exploration_min=0.1,):
+    def train(
+        self,
+        frame_total=10 * 1_000_000,
+        frame_exploration_count=1 * 1_000_000,
+        render_episode_period=10,
+        batch_size=32,
+        frame_target_update_period=1_000,  # 1k (pong in 30m) or 10k
+        episode_save_period=100,
+        frame_train_period=4,
+        frame_learning_start=10_000,
+        exploration_min=0.1,
+    ):
         model = self.model
 
         frame_i = model.frame_i
@@ -327,45 +357,58 @@ class AgentTrainer(object):
                 bar_frame.update()
 
                 if frame_i < frame_exploration_count:
-                    exploration_rate = 1 - frame_i/frame_exploration_count*(1-exploration_min)
+                    exploration_rate = 1 - frame_i / frame_exploration_count * (
+                        1 - exploration_min
+                    )
                 else:
                     exploration_rate = exploration_min
 
-                action = self.agent.get_next_action(s0, exploration_rate=exploration_rate)
+                action = self.agent.get_next_action(
+                    s0, exploration_rate=exploration_rate
+                )
 
                 s1, reward, is_done, _ = self.env.step(action)
                 episode_reward += reward
 
-                if (render_episode_period is not None) and (episode_i % render_episode_period == 0):
+                if (render_episode_period is not None) and (
+                    episode_i % render_episode_period == 0
+                ):
                     self.env.render()
 
                 if is_done:
                     is_playing = False
 
-                self.memory.push({
-                    's0': s0,  # lazy
-                    'a0': action,
-                    'r0': reward,
-                    's1': s1,  # lazy
-                    'done': is_done,
-                })
+                self.memory.push(
+                    {
+                        "s0": s0,  # lazy
+                        "a0": action,
+                        "r0": reward,
+                        "s1": s1,  # lazy
+                        "done": is_done,
+                    }
+                )
 
                 s0 = s1
 
                 # train
-                if frame_i % frame_train_period == 0 and frame_i >= frame_learning_start:
+                if (
+                    frame_i % frame_train_period == 0
+                    and frame_i >= frame_learning_start
+                ):
                     if self.use_prioritized:
-                        ret = self.memory.sample(batch_size*frame_train_period)
+                        ret = self.memory.sample(batch_size * frame_train_period)
                         if ret is None:
                             continue
                         batch, rma, weights = ret
                     else:
-                        batch = self.memory.sample(batch_size*frame_train_period)
+                        batch = self.memory.sample(batch_size * frame_train_period)
                         if batch is None:
                             continue
 
                     self.opt.zero_grad()
-                    losses, q = self.agent.losses_on_batch(batch, return_q=True, target_net=self.target_net)
+                    losses, q = self.agent.losses_on_batch(
+                        batch, return_q=True, target_net=self.target_net
+                    )
                     if self.use_prioritized:
                         self.memory.update_priority(rma, losses.detach())
                         losses *= weights.detach().to(device)
@@ -373,13 +416,15 @@ class AgentTrainer(object):
                     loss.backward()
                     self.opt.step()
 
-                    self.tb.add_scalar('Q', q, frame_i)
-                    self.tb.add_scalar('TD error', loss.item(), frame_i)
+                    self.tb.add_scalar("Q", q, frame_i)
+                    self.tb.add_scalar("TD error", loss.item(), frame_i)
 
                     if frame_i % frame_target_update_period == 0:
-                        tinder.rl.copy_params(src=self.agent.get_network(), dst=self.target_net)
+                        tinder.rl.copy_params(
+                            src=self.agent.get_network(), dst=self.target_net
+                        )
 
-            self.tb.add_scalar('episode.reward', episode_reward, frame_i)
+            self.tb.add_scalar("episode.reward", episode_reward, frame_i)
 
             if episode_i % episode_save_period == 0:
                 model.episode_i = episode_i
