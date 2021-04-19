@@ -9,8 +9,3 @@ Learning of Behavior Trees for Autonomous Agents https://arxiv.org/pdf/1504.0581
 QL-BT: Enhancing Behaviour Tree Design and Implementation with Q-Learning (2000)
 
 Integrating Reinforcement Learning into Behavior Trees by Hierarchical Composition https://www.diva-portal.org/smash/get/diva2:1368535/FULLTEXT01.pdf (2019)
-
-https://eng.uber.com/deep-neuroevolution/
-
-Evolution Strategies as a Scalable Alternative to Reinforcement Learning
-https://openai.com/blog/evolution-strategies/
